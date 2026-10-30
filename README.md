@@ -10,3 +10,9 @@ See [central configuration](https://docs.coderabbit.ai/configuration/central-con
 and [inheritance](https://docs.coderabbit.ai/configuration/configuration-inheritance).
 
 CI checks the file against CodeRabbit's schema on every PR.
+
+CodeRabbit only reads central config from a `coderabbit` repo in the same
+organization, so the kleinbem-dev org has its own copy in
+[kleinbem-dev/coderabbit](https://github.com/kleinbem-dev/coderabbit). Edit the
+config here: on every change to main, `sync-org.yaml` opens a PR there with the
+same file, and it merges once green. Never edit the org copy directly.

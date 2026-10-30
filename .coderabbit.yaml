@@ -1,6 +1,7 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 #
-# Central CodeRabbit config for every kleinbem repo. A repo's own
+# Central CodeRabbit config for every repo of its owner. kleinbem/coderabbit is
+# the source; sync-org.yaml copies it to kleinbem-dev/coderabbit. A repo's own
 # .coderabbit.yaml replaces this file unless it sets `inheritance: true`, in
 # which case it merges on top. The web UI settings don't apply while this file
 # exists.
