@@ -25,6 +25,9 @@ reviews:
   auto_review:
     enabled: true
     drafts: false
+    # Never pause on a busy branch: a paused review reports "skipped", which
+    # passes the required check and lets the PR merge unreviewed (kleinbem#21).
+    auto_pause_after_reviewed_commits: 0
     # Lock bumps, docs syncs and dependency updates: not worth the rate limit.
     ignore_usernames:
       - "kleinbem-bot[bot]"
