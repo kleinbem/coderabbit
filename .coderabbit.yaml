@@ -46,6 +46,9 @@ reviews:
     - "!DASHBOARD.md"
 
   path_instructions:
+    - path: "**"
+      instructions: |
+        Every workaround or fix for someone else's bug (patch, override, pin, disabled tests, blacklisted module, feature switched off, "drop once …") needs a comment linking the upstream issue or PR it waits on: a URL or owner/repo#123. Flag new or changed workarounds without one, and links that point at a closed or merged report (the workaround may be droppable). A comment that only mentions a workaround may say "no-link: <why>".
     - path: "**/*.nix"
       instructions: |
         NixOS fleet config. Check especially:
