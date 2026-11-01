@@ -5,7 +5,7 @@
 # commits them to the sync branch, reset to the target's main, through GraphQL
 # createCommitOnBranch, so GitHub signs the commit and it satisfies the
 # required_signatures ruleset without key material in CI. Then opens a PR with
-# squash auto-merge. Adapted from kleinbem/nix-holds open-signed-pr.sh.
+# squash auto-merge. Adapted from kleinbem-dev/nix-detour open-signed-pr.sh.
 # Needs GH_TOKEN: an App token for TARGET_REPO's owner.
 set -euo pipefail
 
