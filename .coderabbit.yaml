@@ -25,7 +25,9 @@ reviews:
 
   auto_review:
     enabled: true
-    drafts: false
+    # A skipped draft review passes the required check: a draft with auto-merge
+    # armed merges unreviewed the moment it goes ready.
+    drafts: true
     # Never pause on a busy branch: a paused review reports "skipped", which
     # passes the required check and lets the PR merge unreviewed (kleinbem#21).
     auto_pause_after_reviewed_commits: 0
