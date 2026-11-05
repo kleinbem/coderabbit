@@ -29,8 +29,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
+          persist-credentials: false
 
-      # The kleinbem-bot App's installation on the org, scoped to the one repo.
+      # The kleinbem-bot App's installation on the org, scoped to the one repo
+      # and to what sync-to-org.sh does: commit to a branch, open and arm a PR.
       - name: Mint a kleinbem-dev App token
         id: app-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -39,6 +41,8 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: kleinbem-dev
           repositories: coderabbit
+          permission-contents: write
+          permission-pull-requests: write
 
       - name: Open the sync PR when the config differs
         env:
