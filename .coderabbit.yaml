@@ -26,7 +26,8 @@ reviews:
   auto_review:
     enabled: true
     # A skipped draft review passes the required check: a draft with auto-merge
-    # armed merges unreviewed the moment it goes ready.
+    # armed merges unreviewed the moment it goes ready. no-link: GitHub documents
+    # skipped as passing; nothing upstream to wait on.
     drafts: true
     # Never pause on a busy branch: a paused review reports "skipped", which
     # passes the required check and lets the PR merge unreviewed (kleinbem#21).
