@@ -65,6 +65,14 @@ reviews:
       instructions: "Third-party actions must be pinned by commit SHA. Secrets must not reach pull_request runs from forks; flag pull_request_target and self-hosted runners."
     - path: "**/*.tf"
       instructions: "OpenTofu. Watch for changes that force replacement or destroy existing resources, and for secrets in plain variables or outputs."
+    # Agent skills and agents copied from upstream projects (e.g. sveltejs/ai-tools)
+    # stay byte-identical to upstream. no-link: not a bug workaround; doc fixes go upstream.
+    - path: ".agents/skills/**"
+      instructions: |
+        Vendored from upstream projects and kept identical to upstream. Only flag security and permission problems: agent permission modes or tool grants, commands that run code, unpinned installs or downloads, hooks. Skip wording, links, code examples, markdown style and version notes.
+    - path: ".claude/agents/**"
+      instructions: |
+        Vendored from upstream projects and kept identical to upstream. Only flag security and permission problems: agent permission modes or tool grants, commands that run code, unpinned installs or downloads, hooks. Skip wording, links, code examples, markdown style and version notes.
 
 chat:
   auto_reply: true
