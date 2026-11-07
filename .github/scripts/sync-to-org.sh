@@ -19,10 +19,25 @@ branch="sync-from-kleinbem"
 title="Sync the config from kleinbem/coderabbit"
 body="Copied by sync-org.yaml from kleinbem/coderabbit@$(git rev-parse HEAD). Edit the config there, not here."
 
+# Compare against one main commit, the one the sync branch is reset to, so a
+# change on main mid-run can't slip into the sync commit.
+main_sha=$(gh api "repos/$repo/git/ref/heads/main" --jq .object.sha)
+err=$(mktemp)
+trap 'rm -f "$err"' EXIT
+
 additions='[]'
 for path in "$@"; do
   local_b64=$(base64 -w0 "$path")
-  remote_b64=$( (gh api "repos/$repo/contents/$path" --jq .content 2>/dev/null || true) | tr -d '\n')
+  # Raw bytes; only a 404 means "missing there", any other error stops the run.
+  if ! remote_b64=$(gh api -H 'Accept: application/vnd.github.raw+json' \
+    "repos/$repo/contents/$path?ref=$main_sha" 2>"$err" | base64 -w0); then
+    if grep -q 'HTTP 404' "$err"; then
+      remote_b64=""
+    else
+      cat "$err" >&2
+      exit 1
+    fi
+  fi
   if [[ "$local_b64" != "$remote_b64" ]]; then
     additions=$(jq --arg p "$path" --arg c "$local_b64" '. + [{path: $p, contents: $c}]' <<<"$additions")
   fi
@@ -37,7 +52,6 @@ if [[ "$(jq length <<<"$additions")" == 0 ]]; then
   exit 0
 fi
 
-main_sha=$(gh api "repos/$repo/git/ref/heads/main" --jq .object.sha)
 if gh api "repos/$repo/git/ref/heads/$branch" >/dev/null 2>&1; then
   gh api -X PATCH "repos/$repo/git/refs/heads/$branch" -f sha="$main_sha" -F force=true >/dev/null
 else
