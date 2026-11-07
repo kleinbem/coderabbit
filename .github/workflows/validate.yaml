@@ -1,0 +1,21 @@
+name: Validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check .coderabbit.yaml against CodeRabbit's schema
+        run: |
+          curl -fsSL https://coderabbit.ai/integrations/schema.v2.json -o /tmp/schema.json
+          pipx run check-jsonschema --schemafile /tmp/schema.json .coderabbit.yaml

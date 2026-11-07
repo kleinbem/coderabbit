@@ -1,0 +1,50 @@
+name: Sync to kleinbem-dev
+
+# CodeRabbit only reads central config from a `coderabbit` repo in the same
+# organization, so kleinbem-dev/coderabbit holds a copy. This keeps it equal
+# to the source here: every change on main opens a PR there that auto-merges.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .coderabbit.yaml
+      - .github/workflows/sync-org.yaml
+      - .github/scripts/sync-to-org.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-org
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      # Always the current main: a manual run on another branch or a rerun of
+      # an older push must not copy an outdated config.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      # The kleinbem-bot App's installation on the org, scoped to the one repo
+      # and to what sync-to-org.sh does: commit to a branch, open and arm a PR.
+      - name: Mint a kleinbem-dev App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: kleinbem-dev
+          repositories: coderabbit
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open the sync PR when the config differs
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: .github/scripts/sync-to-org.sh kleinbem-dev/coderabbit .coderabbit.yaml
