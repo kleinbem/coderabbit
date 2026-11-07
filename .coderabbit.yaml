@@ -12,8 +12,6 @@ early_access: false
 
 reviews:
   profile: chill
-  # PRs auto-merge once green; reviews inform, they don't block.
-  request_changes_workflow: false
   high_level_summary: true
   poem: false
   in_progress_fortune: false
