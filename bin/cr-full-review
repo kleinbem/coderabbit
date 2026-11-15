@@ -5,7 +5,7 @@
 # paths shows as new, then collects the findings and deletes the PR's branches.
 #
 #   cr-full-review open [-R owner/repo] [-r rev] [-n name] [--dry-run] [path...]
-#   cr-full-review wait <pr-url>        until CodeRabbit has reviewed (asks once after 10 min)
+#   cr-full-review wait <pr-url>        until CodeRabbit has reviewed (`open` asks for the review)
 #   cr-full-review findings <pr-url>    save review bodies and threads to ~/.cache/cr-full-review/
 #   cr-full-review close <pr-url>       save findings, close the PR, delete both branches
 #
@@ -103,11 +103,15 @@ cmd_open() {
     git -c credential.helper= -c credential.helper='!gh auth git-credential' \
     push --no-verify "$remote" "$base:refs/heads/$branch/base" "$head:refs/heads/$branch/all" >/dev/null
   gh label create "$LABEL" -R "$repo" --color 5319e7 --description "Request a CodeRabbit review" >/dev/null 2>&1 || true
-  gh pr create -R "$repo" --base "$branch/base" --head "$branch/all" --label "$LABEL" \
+  local url
+  url=$(gh pr create -R "$repo" --base "$branch/base" --head "$branch/all" --label "$LABEL" \
     --title "[review only] $name full review, do not merge" \
     --body "Full-code CodeRabbit review of ${paths[*]:-the whole tree} at \`$rev\` ($files files). The base branch is an empty tree, so every line shows as new.
 
-**Do not merge.** Findings get fixed in normal PRs; this PR and both branches are deleted afterwards (\`cr-full-review close\`)."
+**Do not merge.** Findings get fixed in normal PRs; this PR and both branches are deleted afterwards (\`cr-full-review close\`).")
+  # CodeRabbit never auto-reviews a PR whose base isn't the default branch: ask.
+  gh pr comment "$url" --body "@$BOT review" >/dev/null
+  echo "$url"
 }
 
 # Has CodeRabbit finished a review (or said it won't)?
@@ -121,12 +125,8 @@ reviewed() {
 
 cmd_wait() {
   parse_pr "${1:?PR URL}"
-  local start=$SECONDS asked=0
+  local start=$SECONDS
   until reviewed; do
-    if ((!asked && SECONDS - start > 600)); then
-      gh pr comment "$PR" -R "$REPO" --body "@$BOT review" >/dev/null; asked=1
-      echo "no review after 10 min: asked once"
-    fi
     ((SECONDS - start < 2700)) || die "no review after 45 min"
     sleep 60
   done
