@@ -34,6 +34,10 @@ reviews:
     ignore_usernames:
       - "kleinbem-bot[bot]"
       - "dependabot[bot]"
+    # Small low-risk PRs that agents label at creation, to save the free plan's
+    # hourly limit for larger ones. Skipped passes the gate; agent-ops has the rule.
+    labels:
+      - "!cr-skip"
 
   # Generated or vendored files.
   path_filters:
