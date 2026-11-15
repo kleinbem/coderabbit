@@ -34,10 +34,13 @@ reviews:
     ignore_usernames:
       - "kleinbem-bot[bot]"
       - "dependabot[bot]"
-    # Small low-risk PRs that agents label at creation, to save the free plan's
-    # hourly limit for larger ones. Skipped passes the gate; agent-ops has the rule.
+    # Opt-in: the free plan gives about one review per hour and repo, so only PRs
+    # labelled cr-review get one; the rest report skipped, which passes the gate.
+    # fleet-lint requires the label on risky paths; agent-ops covers the rest.
     labels:
-      - "!cr-skip"
+      - "cr-review"
+    # Fix pushes would each spend a review; ask with `@coderabbitai review` instead.
+    auto_incremental_review: false
 
   # Generated or vendored files.
   path_filters:
