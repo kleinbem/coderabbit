@@ -26,7 +26,7 @@ has no CodeRabbit (e.g. `kleinbem/nixpkgs`).
 
 ```bash
 cr-full-review open pkgs/by-name/bu/buzz-cli   # paths, or nothing for the whole tree
-cr-full-review wait <pr-url>                   # asks @coderabbitai once after 10 min
+cr-full-review wait <pr-url>                   # open already asked @coderabbitai: auto-review skips non-default bases
 cr-full-review close <pr-url>                  # saves findings to ~/.cache/cr-full-review/, deletes the PR's branches
 ```
 
