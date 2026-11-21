@@ -39,6 +39,10 @@ reviews:
     # fleet-lint requires the label on risky paths; agent-ops covers the rest.
     labels:
       - "cr-review"
+    # Review-only PRs (bin/cr-full-review, coderabbit-steward) sit on review/*
+    # bases; without this the label isn't enough there and they need a comment.
+    base_branches:
+      - "review/.*"
     # Fix pushes would each spend a review; ask with `@coderabbitai review` instead.
     auto_incremental_review: false
 
