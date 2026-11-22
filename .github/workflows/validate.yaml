@@ -19,3 +19,5 @@ jobs:
         run: |
           curl -fsSL https://coderabbit.ai/integrations/schema.v2.json -o /tmp/schema.json
           pipx run check-jsonschema --schemafile /tmp/schema.json .coderabbit.yaml
+      - name: Run pr-wait classifier tests
+        run: bash tests/test-pr-wait.sh
