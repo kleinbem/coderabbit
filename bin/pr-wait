@@ -623,7 +623,7 @@ main() {
           sleep_bounded "$interval"
           continue
         fi
-        last_trigger=$(date +%s)
+        last_trigger=$(($(date +%s) - 10))
         sleep_bounded 30
         ;;
       sleep_then_trigger)
