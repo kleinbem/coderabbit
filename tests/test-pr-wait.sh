@@ -146,7 +146,7 @@ res=$("$PR_WAIT" --classify-fixture "$TMP/unlabelled-skip" --require-review --no
 assert_eq "unlabelled-require-review-fails" "$(jq -r '.action + ":" + (.exit|tostring)' <<<"$res")" "done:1"
 
 # 10. Optional: verify against captured live fixtures when cache base is configured
-CACHE_BASE=${XDG_CACHE_HOME:-${HOME:-}}
+CACHE_BASE=${XDG_CACHE_HOME:-${HOME:+$HOME/.cache}}
 if [[ -n $CACHE_BASE && -d $CACHE_BASE/coderabbit-steward-experiments/cases ]]; then
   CASES=$CACHE_BASE/coderabbit-steward-experiments/cases
   for pair in \

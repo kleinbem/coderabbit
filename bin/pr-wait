@@ -268,7 +268,7 @@ fetch_snapshot() {
   all_cmts=$(jq -c '(.data.repository.pullRequest.firstComments.nodes // []) + (.data.repository.pullRequest.lastComments.nodes // [])' <<<"$raw")
   cmt_has_prev=$(jq -r '.data.repository.pullRequest.lastComments.pageInfo.hasPreviousPage // false' <<<"$raw")
   cmt_before=$(jq -r '.data.repository.pullRequest.lastComments.pageInfo.startCursor // ""' <<<"$raw")
-  oldest_ts=$(jq -r '(.data.repository.pullRequest.lastComments.nodes[0].createdAt // "") | if . != "" then (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601? // 0) else 0 end' <<<"$raw")
+  oldest_ts=$(jq -r '(.data.repository.pullRequest.lastComments.nodes[0].createdAt // "") | if . != "" then (sub("\\.[0-9]+Z$"; "Z") | sub("\\+00:00$"; "Z") | fromdateiso8601? // 0) else 0 end' <<<"$raw")
   local pages=0
   while [[ $cmt_has_prev == true ]] && ((oldest_ts > cutoff)); do
     if ((++pages > 10)); then
@@ -290,7 +290,7 @@ fetch_snapshot() {
     all_cmts=$(jq -c --argjson extra "$(jq -c '.data.repository.pullRequest.comments.nodes // []' <<<"$page")" '. + $extra' <<<"$all_cmts")
     cmt_has_prev=$(jq -r '.data.repository.pullRequest.comments.pageInfo.hasPreviousPage // false' <<<"$page")
     cmt_before=$(jq -r '.data.repository.pullRequest.comments.pageInfo.startCursor // ""' <<<"$page")
-    oldest_ts=$(jq -r '(.data.repository.pullRequest.comments.nodes[0].createdAt // "") | if . != "" then (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601? // 0) else 0 end' <<<"$page")
+    oldest_ts=$(jq -r '(.data.repository.pullRequest.comments.nodes[0].createdAt // "") | if . != "" then (sub("\\.[0-9]+Z$"; "Z") | sub("\\+00:00$"; "Z") | fromdateiso8601? // 0) else 0 end' <<<"$page")
   done
 
   normalize_graphql_snapshot "$raw" "$unresolved" "$all_ctxs" "$all_cmts" "$cmts_complete"
@@ -444,7 +444,7 @@ classify_snapshot() {
         {action: "done", exit: 1, event: "unresolved_threads", detail: ("unresolved_threads=" + ($s.unresolvedThreads | tostring))}
       elif ([ $s.crChecks[] | select(.status != "completed") ] | length) > 0 then
         {action: "wait", exit: 0, event: "cr_in_progress", detail: "CodeRabbit check still running"}
-      elif $s.checksTotal > 0 and $s.checksPending == 0 and ($now - $s.headCommittedEpoch) >= 45
+      elif $s.checksPending == 0 and ($now - $s.headCommittedEpoch) >= 45
            and (($s.autoMerge | not) or ($s.mergeStateStatus | IN("BLOCKED", "DIRTY", "BEHIND", "DRAFT"))) then
         {
           action: "confirm_blocked",
@@ -583,9 +583,11 @@ main() {
       continue
     fi
     decision=$(classify_snapshot "$snap" "$(date +%s)" "$mode" "$review_only" "$require_review" "$last_trigger")
-    IFS=$'\t' read -r action exit_code event detail wait_sec < <(
-      jq -r '[.action, (.exit | tostring), .event, (.detail | gsub("[\\t\\n]"; " ")), ((.waitSeconds // 0) | tostring)] | @tsv' <<<"$decision"
+    local fields=()
+    mapfile -t fields < <(
+      jq -r '.action, (.exit | tostring), .event, ((.detail // "") | gsub("[\\r\\n]"; " ")), ((.waitSeconds // 0) | tostring)' <<<"$decision"
     )
+    action=${fields[0]} exit_code=${fields[1]} event=${fields[2]} detail=${fields[3]} wait_sec=${fields[4]}
 
     case $action in
       done)
@@ -600,9 +602,10 @@ main() {
           continue
         fi
         decision=$(classify_snapshot "$snap" "$(date +%s)" "$mode" "$review_only" "$require_review" "$last_trigger")
-        IFS=$'\t' read -r action exit_code event detail _ < <(
-          jq -r '[.action, (.exit | tostring), .event, (.detail | gsub("[\\t\\n]"; " ")), "0"] | @tsv' <<<"$decision"
+        mapfile -t fields < <(
+          jq -r '.action, (.exit | tostring), .event, ((.detail // "") | gsub("[\\r\\n]"; " "))' <<<"$decision"
         )
+        action=${fields[0]} exit_code=${fields[1]} event=${fields[2]} detail=${fields[3]}
         if [[ $action == "done" || $action == "confirm_blocked" ]]; then
           printf 'EVENT: %s (%s#%s) %s\n' "$event" "$REPO" "$PR" "$detail"
           exit "$exit_code"
