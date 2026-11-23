@@ -17,6 +17,16 @@ organization, so the kleinbem-dev org has its own copy in
 config here: on every change to main, `sync-org.yaml` opens a PR there with the
 same file, and it merges once green. Never edit the org copy directly.
 
+## Waiting on PR reviews and merges
+
+`bin/pr-wait` watches a pull request without deadlocking on rate-limited or
+zero-finding reviews:
+
+```bash
+pr-wait <pr-number-or-url>                  # wait for CodeRabbit (sleeps out rate limits and posts @coderabbitai review)
+pr-wait --until-merged <pr-number-or-url>   # wait after gh pr merge --auto (stops early on red CI, new threads or BLOCKED)
+```
+
 ## Full-code reviews
 
 `bin/cr-full-review` gets a CodeRabbit review of whole files rather than a diff:

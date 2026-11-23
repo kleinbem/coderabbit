@@ -114,22 +114,9 @@ cmd_open() {
   echo "$url"
 }
 
-# Has CodeRabbit finished a review (or said it won't)?
-reviewed() {
-  # --paginate runs --jq per page, so count lines rather than summing lengths.
-  gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
-    --jq ".[] | select(.user.login | startswith(\"$BOT\")) | .id" | grep -q . && return 0
-  gh api "repos/$REPO/issues/$PR/comments" --paginate --jq ".[] | select(.user.login | startswith(\"$BOT\")) | .body" |
-    grep -qiE 'review(s)? (completed|paused|failed)|rate limit|No actionable comments'
-}
-
 cmd_wait() {
   parse_pr "${1:?PR URL}"
-  local start=$SECONDS
-  until reviewed; do
-    ((SECONDS - start < 2700)) || die "no review after 45 min"
-    sleep 60
-  done
+  "$(dirname "$0")/pr-wait" --review-only --require-review "$1"
   echo "reviewed: $(gh pr view "$PR" -R "$REPO" --json url --jq .url)"
 }
 
