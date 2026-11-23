@@ -115,8 +115,8 @@ cmd_open() {
 }
 
 cmd_wait() {
-  "$(dirname "$0")/pr-wait" --review-only "${1:?PR URL}"
-  parse_pr "$1"
+  parse_pr "${1:?PR URL}"
+  "$(dirname "$0")/pr-wait" --review-only --require-review "$1"
   echo "reviewed: $(gh pr view "$PR" -R "$REPO" --json url --jq .url)"
 }
 

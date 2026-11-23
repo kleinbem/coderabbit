@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline unit tests for bin/pr-wait's state classifier.
+# Offline unit tests for bin/pr-wait's GraphQL normalizer and state classifier.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -24,7 +24,85 @@ make_case() {
   printf '%s\n' "$crs" >"$TMP/$name/check_runs.jsonl"
 }
 
-# 1. Rate-limited PR right after opening -> sleep_then_trigger (~56m)
+# 1. Missing option value fails cleanly with exit 2 (no unbound-var crash)
+rc=0
+"$PR_WAIT" --timeout >/dev/null 2>&1 || rc=$?
+assert_eq "missing-opt-arg" "$rc" "2"
+
+# 2. GraphQL normalizer: checkSuite.app.slug, null signature -> head_signed=false, unresolvedThreads priority
+cat >"$TMP/gql-blocked.json" <<'EOF'
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "state": "OPEN",
+        "isDraft": false,
+        "mergeStateStatus": "BLOCKED",
+        "mergeCommit": null,
+        "autoMergeRequest": {"enabledAt": "2026-11-22T17:00:00Z"},
+        "author": {"__typename": "User", "login": "kleinbem"},
+        "headRefOid": "1111222233334444",
+        "labels": {"nodes": [{"name": "cr-review"}]},
+        "reviewThreads": {
+          "pageInfo": {"hasNextPage": false, "endCursor": null},
+          "nodes": []
+        },
+        "firstComments": {"nodes": []},
+        "lastComments": {
+          "pageInfo": {"hasPreviousPage": false, "startCursor": null},
+          "nodes": []
+        },
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "committedDate": "2026-11-22T17:00:00Z",
+                "signature": null,
+                "statusCheckRollup": {
+                  "contexts": {
+                    "pageInfo": {"hasNextPage": false, "endCursor": null},
+                    "nodes": [
+                      {
+                        "__typename": "CheckRun",
+                        "name": "CodeRabbit",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "title": "Finished",
+                        "startedAt": "2026-11-22T17:00:10Z",
+                        "completedAt": "2026-11-22T17:02:00Z",
+                        "checkSuite": {"app": {"slug": "coderabbitai"}}
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
+EOF
+now_2004=$(date -u -d "2026-11-22T20:04:00Z" +%s)
+res=$("$PR_WAIT" --classify-graphql "$TMP/gql-blocked.json" --now "$now_2004")
+assert_eq "gql-review-finished" "$(jq -r '.action + ":" + .event' <<<"$res")" "done:reviewed"
+res=$("$PR_WAIT" --classify-graphql "$TMP/gql-blocked.json" --until-merged --now "$now_2004")
+assert_eq "gql-unsigned-blocked" "$(jq -r '.action + ":" + (.detail | contains("head_signed=false") | tostring)' <<<"$res")" "confirm_blocked:true"
+
+# 3. Unresolved thread wakes --until-merged even while CodeRabbit is still in_progress
+jq '.data.repository.pullRequest.reviewThreads.nodes = [{"isResolved": false}]
+  | .data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[0].status = "IN_PROGRESS"' \
+  "$TMP/gql-blocked.json" >"$TMP/gql-thread-while-running.json"
+res=$("$PR_WAIT" --classify-graphql "$TMP/gql-thread-while-running.json" --until-merged --now "$now_2004")
+assert_eq "gql-thread-priority" "$(jq -r '.action + ":" + .event' <<<"$res")" "done:unresolved_threads"
+
+# 4. CLEAN + autoMerge=true keeps waiting in --until-merged instead of reporting confirm_blocked
+jq '.data.repository.pullRequest.mergeStateStatus = "CLEAN"' "$TMP/gql-blocked.json" >"$TMP/gql-clean-armed.json"
+res=$("$PR_WAIT" --classify-graphql "$TMP/gql-clean-armed.json" --until-merged --now "$now_2004")
+assert_eq "gql-clean-armed-waits" "$(jq -r '.action + ":" + .event' <<<"$res")" "wait:ci_in_progress"
+
+# 5. Rate-limited PR right after opening -> sleep_then_trigger (~56m)
 make_case rl-fresh \
   '{"state":"open","merged":false,"user":{"login":"kleinbem","type":"User"},"labels":[{"name":"cr-review"}],"head":{"sha":"aaaa1111"},"updated_at":"2026-11-22T16:51:12Z"}' \
   '[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-11-22T16:51:45Z","updated_at":"2026-11-22T16:51:45Z","body":"## Review limit reached\n\nNext included review available in 56 minutes."}]' \
@@ -34,42 +112,43 @@ now_1652=$(date -u -d "2026-11-22T16:52:00Z" +%s)
 res=$("$PR_WAIT" --classify-fixture "$TMP/rl-fresh" --now "$now_1652")
 assert_eq "rl-fresh action" "$(jq -r '.action + ":" + .event' <<<"$res")" "sleep_then_trigger:rate_limited"
 
-# 2. Same rate-limited PR 3 hours later -> trigger_review immediately
-now_2004=$(date -u -d "2026-11-22T20:04:00Z" +%s)
+# 6. Same rate-limited PR 3 hours later -> trigger_review immediately
 res=$("$PR_WAIT" --classify-fixture "$TMP/rl-fresh" --now "$now_2004")
 assert_eq "rl-expired action" "$(jq -r '.action + ":" + .event' <<<"$res")" "trigger_review:rate_limit_ready"
 
-# 3. Clean 0-finding review (no PullRequestReview object, only Finished check) -> done:reviewed
-make_case zero-findings \
-  '{"state":"open","merged":false,"user":{"login":"kleinbem","type":"User"},"labels":[{"name":"cr-review"}],"head":{"sha":"bbbb2222"},"updated_at":"2026-11-22T17:00:00Z"}' \
-  '[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-11-22T17:03:00Z","updated_at":"2026-11-22T17:03:00Z","body":"No actionable comments were generated in the recent review."}]' \
-  '{"name":"CodeRabbit","app":{"slug":"coderabbitai"},"head_sha":"bbbb2222","status":"completed","conclusion":"success","output":{"title":"Finished"},"started_at":"2026-11-22T17:00:10Z","completed_at":"2026-11-22T17:03:00Z"}'
+# 7. Stale explicit estimate from an old denial is ignored when a new NEUTRAL denial occurs
+make_case rl-stale-estimate \
+  '{"state":"open","merged":false,"user":{"login":"kleinbem","type":"User"},"labels":[{"name":"cr-review"}],"head":{"sha":"aaaa2222"},"updated_at":"2026-11-22T20:03:00Z"}' \
+  '[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-11-22T16:51:45Z","updated_at":"2026-11-22T16:51:45Z","body":"## Review limit reached\n\nNext included review available in 56 minutes."}]' \
+  '{"name":"CodeRabbit","app":{"slug":"coderabbitai"},"head_sha":"aaaa2222","status":"completed","conclusion":"neutral","output":{"title":"Review rate limited"},"started_at":"2026-11-22T20:03:30Z","completed_at":"2026-11-22T20:03:35Z"}'
 
-res=$("$PR_WAIT" --classify-fixture "$TMP/zero-findings" --now "$now_2004")
-assert_eq "zero-findings" "$(jq -r '.action + ":" + .event' <<<"$res")" "done:reviewed"
+res=$("$PR_WAIT" --classify-fixture "$TMP/rl-stale-estimate" --now "$now_2004")
+assert_eq "rl-stale-estimate" "$(jq -r '.action + ":" + .event' <<<"$res")" "sleep_then_trigger:rate_limited"
 
-# 4. Bot-authored PR -> done:cr_ineligible (exit 1)
-make_case bot-author \
-  '{"state":"open","merged":false,"user":{"login":"coderabbit-steward[bot]","type":"Bot"},"labels":[{"name":"cr-review"}],"head":{"sha":"cccc3333"},"updated_at":"2026-11-22T17:00:00Z"}' \
+# 8. Earlier head's "Review finished" reply does not mask a failed check on a new head
+make_case old-reply-new-fail \
+  '{"state":"open","merged":false,"user":{"login":"kleinbem","type":"User"},"labels":[{"name":"cr-review"}],"head":{"sha":"bbbb9999"},"updated_at":"2026-11-22T20:00:00Z"}' \
+  '[{"user":{"login":"kleinbem"},"created_at":"2026-11-22T19:00:00Z","updated_at":"2026-11-22T19:00:00Z","body":"@coderabbitai review"},{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-11-22T19:02:00Z","updated_at":"2026-11-22T19:02:00Z","body":"<!-- CodeRabbit review command invocation: v2:abc -->\nReview finished."}]' \
+  '{"name":"CodeRabbit","app":{"slug":"coderabbitai"},"head_sha":"bbbb9999","status":"completed","conclusion":"failure","output":{"title":"Failed"},"started_at":"2026-11-22T20:00:10Z","completed_at":"2026-11-22T20:01:00Z"}'
+
+res=$("$PR_WAIT" --classify-fixture "$TMP/old-reply-new-fail" --now "$now_2004")
+assert_eq "old-reply-new-fail" "$(jq -r '.action + ":" + .event + ":" + (.exit|tostring)' <<<"$res")" "done:cr_failed:1"
+
+# 9. Clean 0-finding review + --require-review rejects skipped PRs
+make_case unlabelled-skip \
+  '{"state":"open","merged":false,"user":{"login":"kleinbem","type":"User"},"labels":[],"head":{"sha":"bbbb3333"},"updated_at":"2026-11-22T17:00:00Z"}' \
   '[]' \
-  '{"name":"CodeRabbit","app":{"slug":"coderabbitai"},"head_sha":"cccc3333","status":"completed","conclusion":"skipped","output":{"title":"Review skipped: bot user not eligible for review"},"started_at":"2026-11-22T17:00:05Z","completed_at":"2026-11-22T17:00:05Z"}'
+  '{"name":"CodeRabbit","app":{"slug":"coderabbitai"},"head_sha":"bbbb3333","status":"completed","conclusion":"skipped","output":{"title":"Review skipped: excluded by label configuration"},"started_at":"2026-11-22T17:00:10Z","completed_at":"2026-11-22T17:00:12Z"}'
 
-res=$("$PR_WAIT" --classify-fixture "$TMP/bot-author" --now "$now_2004")
-assert_eq "bot-author" "$(jq -r '.action + ":" + .event + ":" + (.exit|tostring)' <<<"$res")" "done:cr_ineligible:1"
+res=$("$PR_WAIT" --classify-fixture "$TMP/unlabelled-skip" --now "$now_2004")
+assert_eq "unlabelled-default-ok" "$(jq -r '.action + ":" + (.exit|tostring)' <<<"$res")" "done:0"
+res=$("$PR_WAIT" --classify-fixture "$TMP/unlabelled-skip" --require-review --now "$now_2004")
+assert_eq "unlabelled-require-review-fails" "$(jq -r '.action + ":" + (.exit|tostring)' <<<"$res")" "done:1"
 
-# 5. All checks green in --until-merged mode while still OPEN & BLOCKED -> confirm_blocked
-make_case post-arm-blocked \
-  '{"state":"open","merged":false,"mergeable_state":"blocked","auto_merge":{"enabled_by":{}},"user":{"login":"kleinbem","type":"User"},"labels":[{"name":"cr-review"}],"head":{"sha":"dddd4444"},"updated_at":"2026-11-22T17:00:00Z"}' \
-  '[]' \
-  '{"name":"check","app":{"slug":"github-actions"},"head_sha":"dddd4444","status":"completed","conclusion":"success","output":{"title":"check"},"started_at":"2026-11-22T17:00:10Z","completed_at":"2026-11-22T17:05:00Z"}'
-
-res=$("$PR_WAIT" --classify-fixture "$TMP/post-arm-blocked" --until-merged --now "$now_2004")
-assert_eq "post-arm-blocked" "$(jq -r '.action + ":" + .event' <<<"$res")" "confirm_blocked:blocked"
-
-# 6. Optional: verify against captured live fixtures in ~/.cache/coderabbit-steward-experiments/cases
-CASES="${XDG_CACHE_HOME:-$HOME/.cache}/coderabbit-steward-experiments/cases"
-if [[ -d $CASES ]]; then
-  # Open-state overrides for captured fixtures (which were recorded after merge/close).
+# 10. Optional: verify against captured live fixtures when cache base is configured
+CACHE_BASE=${XDG_CACHE_HOME:-${HOME:-}}
+if [[ -n $CACHE_BASE && -d $CACHE_BASE/coderabbit-steward-experiments/cases ]]; then
+  CASES=$CACHE_BASE/coderabbit-steward-experiments/cases
   for pair in \
     "no-actionable-comments:done:reviewed" \
     "reviewed-human-author-labelled:done:reviewed" \
@@ -83,7 +162,6 @@ if [[ -d $CASES ]]; then
     [[ -d $CASES/$cname ]] || continue
     cp -r "$CASES/$cname" "$TMP/live-$cname"
     jq '.state = "open" | .merged = false | .labels = [{"name":"cr-review"}]' "$CASES/$cname/pull.json" >"$TMP/live-$cname/pull.json"
-    # Evaluate 30s after the last check_run completed_at in that fixture.
     last_ts=$(jq -r '.completed_at' "$CASES/$cname/check_runs.jsonl" | tail -1)
     eval_now=$(($(date -u -d "$last_ts" +%s) + 30))
     res=$("$PR_WAIT" --classify-fixture "$TMP/live-$cname" --now "$eval_now")
