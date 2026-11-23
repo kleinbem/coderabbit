@@ -618,7 +618,11 @@ main() {
         fi
         sleep_bounded $((RANDOM % 15 + 1))
         printf '[%s] %s#%s: %s -> posting @%s review\n' "$(date -u +%H:%M:%SZ)" "$REPO" "$PR" "$detail" "$BOT"
-        gh pr comment "$PR" -R "$REPO" --body "@$BOT review" >/dev/null
+        if ! gh pr comment "$PR" -R "$REPO" --body "@$BOT review" >/dev/null; then
+          printf 'pr-wait: failed to post review comment (will retry)\n' >&2
+          sleep_bounded "$interval"
+          continue
+        fi
         last_trigger=$(date +%s)
         sleep_bounded 30
         ;;
