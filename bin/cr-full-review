@@ -5,6 +5,7 @@
 # paths shows as new, then collects the findings and deletes the PR's branches.
 #
 #   cr-full-review open [-R owner/repo] [-r rev] [-n name] [--dry-run] [path...]
+#   cr-full-review steward [-R owner/repo] [path...]   queue via cr-steward (full repo or paths)
 #   cr-full-review wait <pr-url>        until CodeRabbit has reviewed (`open` asks for the review)
 #   cr-full-review findings <pr-url>    save review bodies and threads to ~/.cache/cr-full-review/
 #   cr-full-review close <pr-url>       save findings, close the PR, delete both branches
@@ -170,8 +171,35 @@ cmd_close() {
   echo "closed $REPO#$PR, deleted $base and $head"
 }
 
+cmd_steward() {
+  command -v cr-steward >/dev/null 2>&1 || die "cr-steward not found on PATH (use 'open' for standalone mode)"
+  local repo="" paths=()
+  while (($#)); do
+    case $1 in
+      -R) repo=$2; shift 2 ;;
+      -h|--help) usage ;;
+      --) shift; paths+=("$@"); break ;;
+      -*) die "unknown option $1" ;;
+      *) paths+=("$1"); shift ;;
+    esac
+  done
+  if [[ -z $repo ]]; then
+    if command -v jj >/dev/null && jj root >/dev/null 2>&1; then
+      git rev-parse --git-dir >/dev/null 2>&1 || { GIT_DIR=$(jj git root); export GIT_DIR; }
+    fi
+    repo=$(repo_of_url "$(git remote get-url --push origin)")
+  fi
+  if ((${#paths[@]})); then
+    local joined
+    joined=$(IFS=,; printf '%s' "${paths[*]}")
+    exec cr-steward request "$repo" --paths "$joined"
+  else
+    exec cr-steward request "$repo" --full
+  fi
+}
+
 case ${1:-} in
-  open|wait|findings|close) c=$1; shift; "cmd_$c" "$@" ;;
+  open|steward|wait|findings|close) c=$1; shift; "cmd_$c" "$@" ;;
   -h|--help|"") usage ;;
-  *) die "unknown command $1 (open, wait, findings, close)" ;;
+  *) die "unknown command $1 (open, steward, wait, findings, close)" ;;
 esac
