@@ -1,0 +1,653 @@
+#!/usr/bin/env bash
+# pr-wait: wait for CodeRabbit review or PR auto-merge without deadlocking.
+#
+#   pr-wait [-R owner/repo] [--review-only] [--require-review] [--no-trigger] [--interval SEC] [--timeout SEC] <pr>
+#   pr-wait [-R owner/repo] --until-merged [--interval SEC] [--timeout SEC] <pr>
+#   pr-wait --classify-fixture <case-dir> [--now EPOCH] [--last-trigger EPOCH] [--until-merged] [--review-only] [--require-review]
+#   pr-wait --classify-graphql <json-file> [--now EPOCH] [--last-trigger EPOCH] [--until-merged] [--review-only] [--require-review]
+#
+# Default mode waits until CodeRabbit settles on the PR's current head:
+#   - Exits 0 when CodeRabbit finishes reviewing (including 0-finding reviews)
+#     or skips intentionally (unless --require-review is passed).
+#   - Exits 1 immediately if the PR closes, author is an ineligible bot, or any
+#     CI check fails (unless --review-only is set).
+#   - On CodeRabbit's hourly OSS rate limit, sleeps until the reset window
+#     (waking early if CI fails or the PR changes) and posts `@coderabbitai review`.
+#
+# --until-merged waits after `gh pr merge --auto` is armed:
+#   - Exits 0 when the PR merges.
+#   - Exits 1 immediately if a CI check fails, an unresolved review thread is
+#     open, or all checks finish while the PR is BLOCKED / DIRTY / un-armed.
+set -euo pipefail
+
+BOT=coderabbitai
+LABEL=cr-review
+
+die() { echo "pr-wait: $*" >&2; exit 2; }
+usage() { sed -n '2,21s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
+
+repo_of_url() { sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##' <<<"$1"; }
+
+resolve_target() {
+  local arg=$1 repo_opt=$2
+  if [[ $arg =~ github\.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
+    REPO=${BASH_REMATCH[1]}
+    PR=${BASH_REMATCH[2]}
+    return
+  fi
+  [[ $arg =~ ^[0-9]+$ ]] || die "expected PR number or URL, got: $arg"
+  PR=$arg
+  if [[ -n $repo_opt ]]; then
+    REPO=$repo_opt
+    return
+  fi
+  if command -v jj >/dev/null && jj root >/dev/null 2>&1; then
+    git rev-parse --git-dir >/dev/null 2>&1 || { GIT_DIR=$(jj git root); export GIT_DIR; }
+  fi
+  git rev-parse --git-dir >/dev/null 2>&1 || die "pass -R owner/repo or a full PR URL outside a repo"
+  REPO=$(repo_of_url "$(git remote get-url --push origin)")
+}
+
+# Normalize a raw GraphQL pullRequest payload (plus pre-aggregated arrays for
+# paginated connections) into the canonical classifier snapshot.
+normalize_graphql_snapshot() {
+  local raw=$1 unresolved=$2 all_ctxs=$3 all_cmts=$4 cmts_complete=$5
+  # Stream the potentially large GraphQL payload and paginated arrays via stdin
+  # instead of --argjson to avoid Linux MAX_ARG_STRLEN (128 KiB) argv limits on
+  # large multi-file reviews.
+  printf '%s\n%s\n%s\n' "$raw" "$all_ctxs" "$all_cmts" | \
+  jq -s \
+     --argjson unresolved "$unresolved" \
+     --argjson cmts_complete "$cmts_complete" \
+     --arg label "$LABEL" '
+    def ts:
+      if type == "string" then
+        (sub("\\.[0-9]+Z$"; "Z") | sub("\\+00:00$"; "Z") | fromdateiso8601? // 0)
+      else 0 end;
+    def norm_login: (ascii_downcase | sub("\\[bot\\]$"; ""));
+    def is_cr_check:
+      .__typename == "CheckRun" and (((.checkSuite.app.slug // "") == "coderabbitai") or .name == "CodeRabbit");
+
+    .[0].data.repository.pullRequest as $pr |
+    .[1] as $ctxs |
+    .[2] as $cmts |
+    ($pr.commits.nodes[0].commit // {}) as $c |
+    ($cmts | unique_by(.databaseId)) as $uniq_cmts |
+
+    {
+      state: $pr.state,
+      isDraft: ($pr.isDraft // false),
+      mergeStateStatus: ($pr.mergeStateStatus // "UNKNOWN"),
+      mergeCommit: ($pr.mergeCommit.oid // null),
+      autoMerge: ($pr.autoMergeRequest != null),
+      authorLogin: (($pr.author.login // "") | norm_login),
+      authorIsBot: (($pr.author.__typename // "") == "Bot"),
+      headOid: ($pr.headRefOid // ""),
+      headCommittedEpoch: ($c.committedDate | ts),
+      headSignatureValid: ($c.signature.isValid // false),
+      hasCrLabel: ([($pr.labels.nodes // [])[].name] | index($label) != null),
+      commentsComplete: $cmts_complete,
+      unresolvedThreads: $unresolved,
+      checksTotal: ($ctxs | length),
+      checksPending: (
+        [ $ctxs[] |
+          select(
+            (.__typename == "CheckRun" and ((.status // "" | ascii_downcase) != "completed")) or
+            (.__typename == "StatusContext" and ((.state // "" | ascii_downcase) == "pending"))
+          )
+        ] | length
+      ),
+      checksFailed: (
+        [ $ctxs[] |
+          select(is_cr_check | not) |
+          if .__typename == "CheckRun" then
+            select((.conclusion // "" | ascii_downcase) | IN("failure", "timed_out", "cancelled", "action_required", "startup_failure")) | .name
+          elif .__typename == "StatusContext" then
+            select((.state // "" | ascii_downcase) | IN("failure", "error")) | .context
+          else empty end
+        ]
+      ),
+      crChecks: (
+        [ $ctxs[] |
+          select(is_cr_check) |
+          {
+            status: (.status // "" | ascii_downcase),
+            conclusion: (.conclusion // "" | ascii_downcase),
+            title: (.title // ""),
+            startedEpoch: (.startedAt | ts),
+            completedEpoch: (.completedAt | ts)
+          }
+        ] | sort_by(.startedEpoch)
+      ),
+      comments: (
+        [ $uniq_cmts[] |
+          {
+            author: ((.author.login // "") | norm_login),
+            createdEpoch: (.createdAt | ts),
+            updatedEpoch: ((.updatedAt // .createdAt) | ts),
+            body: (.body // "")
+          }
+        ] | sort_by(.createdEpoch)
+      )
+    }
+  '
+}
+
+# Fetch a normalized JSON snapshot of the PR via GraphQL, following pagination
+# on reviewThreads, statusCheckRollup.contexts, and recent comments when needed.
+fetch_snapshot() {
+  local owner=${REPO%/*} name=${REPO#*/} raw err
+  # shellcheck disable=SC2016 # GraphQL variables
+  if ! raw=$(gh api graphql -f owner="$owner" -f name="$name" -F pr="$PR" -f query='
+    query($owner: String!, $name: String!, $pr: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $pr) {
+          state
+          isDraft
+          mergeStateStatus
+          mergeCommit { oid }
+          autoMergeRequest { enabledAt }
+          author { __typename login }
+          headRefOid
+          labels(first: 30) { nodes { name } }
+          reviewThreads(first: 100) {
+            pageInfo { hasNextPage endCursor }
+            nodes { isResolved }
+          }
+          firstComments: comments(first: 5) {
+            nodes { databaseId author { login } createdAt updatedAt body }
+          }
+          lastComments: comments(last: 100) {
+            pageInfo { hasPreviousPage startCursor }
+            nodes { databaseId author { login } createdAt updatedAt body }
+          }
+          commits(last: 1) {
+            nodes {
+              commit {
+                committedDate
+                signature { isValid }
+                statusCheckRollup {
+                  contexts(first: 100) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      __typename
+                      ... on CheckRun {
+                        name
+                        status
+                        conclusion
+                        title
+                        startedAt
+                        completedAt
+                        checkSuite { app { slug } }
+                      }
+                      ... on StatusContext {
+                        context
+                        state
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }' 2>&1); then
+    err=${raw%%$'\n'*}
+    printf 'pr-wait: GraphQL fetch failed (will retry): %s\n' "$err" >&2
+    return 1
+  fi
+
+  # 1. Paginate reviewThreads if >100.
+  local unresolved has_next after page
+  unresolved=$(jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length' <<<"$raw")
+  has_next=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' <<<"$raw")
+  after=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // ""' <<<"$raw")
+  while [[ $has_next == true ]]; do
+    # shellcheck disable=SC2016
+    page=$(gh api graphql -f owner="$owner" -f name="$name" -F pr="$PR" -f after="$after" -f query='
+      query($owner: String!, $name: String!, $pr: Int!, $after: String!) {
+        repository(owner: $owner, name: $name) {
+          pullRequest(number: $pr) {
+            reviewThreads(first: 100, after: $after) {
+              pageInfo { hasNextPage endCursor }
+              nodes { isResolved }
+            }
+          }
+        }
+      }') || return 1
+    unresolved=$((unresolved + $(jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length' <<<"$page")))
+    has_next=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' <<<"$page")
+    after=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // ""' <<<"$page")
+  done
+
+  # 2. Paginate statusCheckRollup.contexts if >100.
+  local all_ctxs ctx_has_next ctx_after
+  all_ctxs=$(jq -c '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes // []' <<<"$raw")
+  ctx_has_next=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage // false' <<<"$raw")
+  ctx_after=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor // ""' <<<"$raw")
+  while [[ $ctx_has_next == true ]]; do
+    # shellcheck disable=SC2016
+    page=$(gh api graphql -f owner="$owner" -f name="$name" -F pr="$PR" -f after="$ctx_after" -f query='
+      query($owner: String!, $name: String!, $pr: Int!, $after: String!) {
+        repository(owner: $owner, name: $name) {
+          pullRequest(number: $pr) {
+            commits(last: 1) {
+              nodes {
+                commit {
+                  statusCheckRollup {
+                    contexts(first: 100, after: $after) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        __typename
+                        ... on CheckRun {
+                          name
+                          status
+                          conclusion
+                          title
+                          startedAt
+                          completedAt
+                          checkSuite { app { slug } }
+                        }
+                        ... on StatusContext {
+                          context
+                          state
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }') || return 1
+    all_ctxs=$(jq -c --argjson extra "$(jq -c '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes // []' <<<"$page")" '. + $extra' <<<"$all_ctxs")
+    ctx_has_next=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage // false' <<<"$page")
+    ctx_after=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor // ""' <<<"$page")
+  done
+
+  # 3. Paginate comments backwards if >100 until covering at least the last 2 hours.
+  local all_cmts cmt_has_prev cmt_before cutoff oldest_ts cmts_complete=true
+  cutoff=$(($(date +%s) - 7200))
+  all_cmts=$(jq -c '(.data.repository.pullRequest.firstComments.nodes // []) + (.data.repository.pullRequest.lastComments.nodes // [])' <<<"$raw")
+  cmt_has_prev=$(jq -r '.data.repository.pullRequest.lastComments.pageInfo.hasPreviousPage // false' <<<"$raw")
+  cmt_before=$(jq -r '.data.repository.pullRequest.lastComments.pageInfo.startCursor // ""' <<<"$raw")
+  oldest_ts=$(jq -r '(.data.repository.pullRequest.lastComments.nodes[0].createdAt // "") | if . != "" then (sub("\\.[0-9]+Z$"; "Z") | sub("\\+00:00$"; "Z") | fromdateiso8601? // 0) else 0 end' <<<"$raw")
+  local pages=0
+  while [[ $cmt_has_prev == true ]] && ((oldest_ts > cutoff)); do
+    if ((++pages > 10)); then
+      cmts_complete=false
+      break
+    fi
+    # shellcheck disable=SC2016
+    page=$(gh api graphql -f owner="$owner" -f name="$name" -F pr="$PR" -f before="$cmt_before" -f query='
+      query($owner: String!, $name: String!, $pr: Int!, $before: String!) {
+        repository(owner: $owner, name: $name) {
+          pullRequest(number: $pr) {
+            comments(last: 100, before: $before) {
+              pageInfo { hasPreviousPage startCursor }
+              nodes { databaseId author { login } createdAt updatedAt body }
+            }
+          }
+        }
+      }') || return 1
+    all_cmts=$(jq -c --argjson extra "$(jq -c '.data.repository.pullRequest.comments.nodes // []' <<<"$page")" '. + $extra' <<<"$all_cmts")
+    cmt_has_prev=$(jq -r '.data.repository.pullRequest.comments.pageInfo.hasPreviousPage // false' <<<"$page")
+    cmt_before=$(jq -r '.data.repository.pullRequest.comments.pageInfo.startCursor // ""' <<<"$page")
+    oldest_ts=$(jq -r '(.data.repository.pullRequest.comments.nodes[0].createdAt // "") | if . != "" then (sub("\\.[0-9]+Z$"; "Z") | sub("\\+00:00$"; "Z") | fromdateiso8601? // 0) else 0 end' <<<"$page")
+  done
+
+  normalize_graphql_snapshot "$raw" "$unresolved" "$all_ctxs" "$all_cmts" "$cmts_complete"
+}
+
+# Normalize a single-page GraphQL fixture file for offline testing.
+snapshot_from_graphql_file() {
+  local file=$1 raw unresolved all_ctxs all_cmts cmts_complete
+  raw=$(cat "$file")
+  unresolved=$(jq '[.data.repository.pullRequest.reviewThreads.nodes[]? | select(.isResolved | not)] | length' <<<"$raw")
+  all_ctxs=$(jq -c '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes // []' <<<"$raw")
+  all_cmts=$(jq -c '(.data.repository.pullRequest.firstComments.nodes // []) + (.data.repository.pullRequest.lastComments.nodes // [])' <<<"$raw")
+  cmts_complete=$(jq -r '((.data.repository.pullRequest.lastComments.pageInfo.hasPreviousPage // false) | not) | tostring' <<<"$raw")
+  normalize_graphql_snapshot "$raw" "$unresolved" "$all_ctxs" "$all_cmts" "$cmts_complete"
+}
+
+# Build the same normalized snapshot from a recorded REST fixture directory
+# (pull.json, comments.json, check_runs.jsonl).
+snapshot_from_fixture_dir() {
+  local dir=$1
+  jq -n \
+    --slurpfile pull "$dir/pull.json" \
+    --slurpfile cmts "$dir/comments.json" \
+    --slurpfile crs "$dir/check_runs.jsonl" \
+    --arg label "$LABEL" '
+    def ts:
+      if type == "string" then
+        (sub("\\.[0-9]+Z$"; "Z") | sub("\\+00:00$"; "Z") | fromdateiso8601? // 0)
+      else 0 end;
+    def norm_login: (ascii_downcase | sub("\\[bot\\]$"; ""));
+
+    $pull[0] as $p |
+    ($p.head.sha // "") as $head |
+    (if ([ $crs[] | select(.head_sha == $head) ] | length) > 0
+     then [ $crs[] | select(.head_sha == $head) ]
+     else $crs end) as $head_crs |
+
+    {
+      state: (if ($p.merged // false) then "MERGED" elif ($p.state // "" | ascii_downcase) == "closed" then "CLOSED" else "OPEN" end),
+      isDraft: ($p.draft // false),
+      mergeStateStatus: (($p.mergeable_state // "unknown") | ascii_upcase),
+      mergeCommit: ($p.merge_commit_sha // null),
+      autoMerge: ($p.auto_merge != null),
+      authorLogin: (($p.user.login // "") | norm_login),
+      authorIsBot: (($p.user.type // "") == "Bot"),
+      headOid: $head,
+      headCommittedEpoch: ($p.updated_at | ts),
+      headSignatureValid: true,
+      hasCrLabel: ([($p.labels // [])[].name] | index($label) != null),
+      commentsComplete: true,
+      unresolvedThreads: ($p.unresolved_threads // 0),
+      checksTotal: ($head_crs | length),
+      checksPending: ([ $head_crs[] | select((.status // "" | ascii_downcase) != "completed") ] | length),
+      checksFailed: [],
+      crChecks: (
+        [ $head_crs[] |
+          select((.app.slug // "") == "coderabbitai" or .name == "CodeRabbit") |
+          {
+            status: (.status // "" | ascii_downcase),
+            conclusion: (.conclusion // "" | ascii_downcase),
+            title: (.output.title // ""),
+            startedEpoch: (.started_at | ts),
+            completedEpoch: (.completed_at | ts)
+          }
+        ] | sort_by(.startedEpoch)
+      ),
+      comments: (
+        [ ($cmts[0] // [])[] |
+          {
+            author: ((.user.login // "") | norm_login),
+            createdEpoch: (.created_at | ts),
+            updatedEpoch: ((.updated_at // .created_at) | ts),
+            body: (.body // "")
+          }
+        ] | sort_by(.createdEpoch)
+      )
+    }
+  '
+}
+
+# Pure classifier over a normalized snapshot.
+# Emits JSON: {action, exit, event, detail, waitSeconds?}
+#   action in: "done" | "wait" | "trigger_review" | "sleep_then_trigger" | "confirm_blocked"
+classify_snapshot() {
+  local snap=$1 now=$2 mode=$3 review_only=$4 require_review=$5 last_trigger=$6
+  jq --argjson now "$now" \
+     --arg mode "$mode" \
+     --argjson review_only "$review_only" \
+     --argjson require_review "$require_review" \
+     --argjson last_trigger "$last_trigger" \
+     --arg bot "$BOT" '
+    . as $s |
+    (if $require_review then 1 else 0 end) as $skip_exit |
+
+    # Latest @coderabbitai review ask from a non-bot user (or this process).
+    (
+      [ $s.comments[]
+        | select(.author != $bot and (.body | test("@" + $bot + "\\s+review\\b"; "i")))
+        | .createdEpoch
+      ] + [$last_trigger] | max
+    ) as $last_ask |
+
+    # Latest command-invocation reply from CodeRabbit after $last_ask.
+    (
+      if $last_ask > 0 then
+        ([ $s.comments[]
+           | select(.author == $bot and .createdEpoch >= $last_ask and (.body | test("review command invocation"; "i")))
+         ] | last)
+      else null end
+    ) as $cmd_reply |
+
+    ($s.crChecks | last) as $cr |
+
+    # Rate-limit cooldown calculator for a denial at $rl_epoch:
+    # An explicit "available in N min/sec" comment applies only when emitted for
+    # this denial (updated within 120s of $rl_epoch and not before $last_ask).
+    def rate_limit_target($rl_epoch):
+      ([ $s.comments[]
+         | select(.author == $bot)
+         | (.updatedEpoch // .createdEpoch) as $t
+         | select($t >= ($rl_epoch - 120) and $t >= $last_ask)
+         | (
+             if (.body | test("(?:Next included review|More reviews) (?:will be )?available in [0-9]+ min"; "i")) then
+               (.body | capture("(?:Next included review|More reviews) (?:will be )?available in (?<n>[0-9]+) min"; "i").n | tonumber) * 60 + $t + 90
+             elif (.body | test("(?:Next included review|More reviews) (?:will be )?available in [0-9]+ sec"; "i")) then
+               (.body | capture("(?:Next included review|More reviews) (?:will be )?available in (?<n>[0-9]+) sec"; "i").n | tonumber) + $t + 30
+             else empty end
+           )
+       ] | max // 0) as $explicit_target |
+      (
+        ([ $s.comments[]
+           | select(.author == $bot and (.body | test("0 remain after this review"; "i")))
+           | (.updatedEpoch // .createdEpoch)
+         ] + [ $s.crChecks[] | select(.conclusion == "success") | .startedEpoch ]
+         | max // 0) as $last_spend |
+        if $last_spend > 0 and ($last_spend + 3690) > $rl_epoch then ($last_spend + 3690) else 0 end
+      ) as $spend_target |
+      if $explicit_target > 0 then $explicit_target
+      elif $spend_target > 0 then $spend_target
+      else ($rl_epoch + 900) end;
+
+    if $s.state == "MERGED" then
+      {action: "done", exit: 0, event: "merged", detail: (($s.mergeCommit // $s.headOid)[0:8])}
+    elif $s.state == "CLOSED" then
+      {action: "done", exit: 1, event: "closed", detail: "PR closed without merging"}
+    elif ($review_only | not) and (($s.checksFailed | length) > 0) then
+      {action: "done", exit: 1, event: "ci_failed", detail: ($s.checksFailed | join(","))}
+
+    elif $mode == "merge" then
+      if $s.unresolvedThreads > 0 then
+        {action: "done", exit: 1, event: "unresolved_threads", detail: ("unresolved_threads=" + ($s.unresolvedThreads | tostring))}
+      elif ([ $s.crChecks[] | select(.status != "completed") ] | length) > 0 then
+        {action: "wait", exit: 0, event: "cr_in_progress", detail: "CodeRabbit check still running"}
+      elif $s.checksPending == 0 and ($now - $s.headCommittedEpoch) >= 45
+           and (($s.autoMerge | not) or ($s.mergeStateStatus | IN("BLOCKED", "DIRTY", "BEHIND", "DRAFT"))) then
+        {
+          action: "confirm_blocked",
+          exit: 1,
+          event: "blocked",
+          detail: ("mergeStateStatus=" + $s.mergeStateStatus + " autoMerge=" + ($s.autoMerge | tostring) + " unresolved_threads=" + ($s.unresolvedThreads | tostring) + " head_signed=" + ($s.headSignatureValid | tostring))
+        }
+      else
+        {action: "wait", exit: 0, event: "ci_in_progress", detail: ("pending=" + ($s.checksPending | tostring) + "/" + ($s.checksTotal | tostring) + " mergeStateStatus=" + $s.mergeStateStatus)}
+      end
+
+    else
+      # mode == "review"
+      if $s.authorIsBot or (($cr.title // "") | test("bot user not eligible"; "i")) then
+        {action: "done", exit: 1, event: "cr_ineligible", detail: "bot author not eligible for CodeRabbit review"}
+      elif $cr != null and $cr.status != "completed" then
+        {action: "wait", exit: 0, event: "cr_in_progress", detail: ($cr.title // $cr.status)}
+      elif $last_ask > 0 and (($cr.startedEpoch // 0) < ($last_ask - 5)) and $cmd_reply == null and (($now - $last_ask) < 300) then
+        {action: "wait", exit: 0, event: "cr_starting", detail: "waiting for CodeRabbit to pick up @coderabbitai review"}
+      elif ($cmd_reply != null and ($cmd_reply.body | test("Review rate limited"; "i")) and ($last_ask > ($cr.startedEpoch // 0)))
+           or ($cr != null and ($cr.conclusion == "neutral" or ($cr.title | test("rate limit"; "i")))) then
+        (([($cr.completedEpoch // 0), ($cmd_reply.updatedEpoch // 0)] | max)) as $rl_epoch |
+        rate_limit_target($rl_epoch) as $target |
+        if ($s.commentsComplete | not) then
+          {action: "wait", exit: 0, event: "comments_incomplete", detail: "comment history truncated; polling without posting"}
+        elif $now >= $target and ($last_ask < $rl_epoch or ($now - $last_ask) >= 900) then
+          {action: "trigger_review", exit: 0, event: "rate_limit_ready", detail: "rate-limit window elapsed", waitSeconds: 0}
+        else
+          ((if $target > $now then ($target - $now) else (900 - ($now - $last_ask)) end)) as $wait |
+          {action: "sleep_then_trigger", exit: 0, event: "rate_limited", detail: ("waiting " + (($wait + 59) / 60 | floor | tostring) + "m for rate limit reset"), waitSeconds: $wait}
+        end
+      elif $cr == null then
+        if ($now - $s.headCommittedEpoch) < 90 or $s.checksTotal == 0 then
+          {action: "wait", exit: 0, event: "checks_pending", detail: "waiting for CodeRabbit check run"}
+        elif ($s.commentsComplete | not) then
+          {action: "wait", exit: 0, event: "comments_incomplete", detail: "comment history truncated; polling without posting"}
+        elif $s.hasCrLabel and $last_ask < $s.headCommittedEpoch then
+          {action: "trigger_review", exit: 0, event: "missing_check_trigger", detail: "no CodeRabbit check after 90s; requesting review", waitSeconds: 0}
+        else
+          {action: "done", exit: $skip_exit, event: "cr_absent", detail: "no CodeRabbit check on this PR"}
+        end
+      elif $cr.conclusion == "success"
+           or ($cmd_reply != null
+               and ($cmd_reply.createdEpoch >= $s.headCommittedEpoch)
+               and ($cmd_reply.body | test("Review finished"; "i"))
+               and (($cr.conclusion | IN("failure", "timed_out", "cancelled", "action_required", "startup_failure")) | not)) then
+        {action: "done", exit: 0, event: "reviewed", detail: ("head=" + $s.headOid[0:8] + " unresolved_threads=" + ($s.unresolvedThreads | tostring))}
+      elif $cr.conclusion == "skipped" then
+        if ($cr.title | test("excluded by label"; "i")) then
+          if ($s.hasCrLabel | not) then
+            {action: "done", exit: $skip_exit, event: "cr_skipped_unlabelled", detail: "PR does not have cr-review label"}
+          elif ($now - $cr.completedEpoch) < 60 or ($s.commentsComplete | not) then
+            {action: "wait", exit: 0, event: "cr_label_pending", detail: "waiting for CodeRabbit after cr-review label"}
+          elif $last_ask < $cr.completedEpoch then
+            {action: "trigger_review", exit: 0, event: "label_ignored_trigger", detail: "label check stayed skipped; requesting @coderabbitai review", waitSeconds: 0}
+          else
+            {action: "done", exit: $skip_exit, event: "cr_skipped", detail: $cr.title}
+          end
+        elif ($cr.title | test("incremental reviews are disabled"; "i")) then
+          if $last_ask > $cr.completedEpoch and $cmd_reply == null and (($now - $last_ask) < 300) then
+            {action: "wait", exit: 0, event: "cr_starting", detail: "waiting for requested incremental review"}
+          else
+            {action: "done", exit: $skip_exit, event: "cr_skipped_incremental", detail: ("head=" + $s.headOid[0:8] + " unresolved_threads=" + ($s.unresolvedThreads | tostring))}
+          end
+        else
+          {action: "done", exit: $skip_exit, event: "cr_skipped", detail: ($cr.title // "skipped")}
+        end
+      else
+        {action: "done", exit: 1, event: "cr_failed", detail: (($cr.conclusion // "unknown") + ": " + ($cr.title // ""))}
+      end
+    end
+  ' <<<"$snap"
+}
+
+main() {
+  local repo="" mode=review review_only=false require_review=false no_trigger=false interval=90 timeout=10800
+  local fixture_dir="" graphql_file="" fixture_now="" last_trigger=0 arg=""
+  while (($#)); do
+    case $1 in
+      -R) (($# >= 2)) || die "missing value for $1"; repo=$2; shift 2 ;;
+      --until-merged) mode=merge; shift ;;
+      --review-only) review_only=true; shift ;;
+      --require-review) require_review=true; shift ;;
+      --no-trigger) no_trigger=true; shift ;;
+      --interval)
+        (($# >= 2)) || die "missing value for $1"
+        [[ $2 =~ ^[1-9][0-9]*$ ]] || die "invalid interval: $2"
+        interval=$2; shift 2 ;;
+      --timeout)
+        (($# >= 2)) || die "missing value for $1"
+        [[ $2 =~ ^[1-9][0-9]*$ ]] || die "invalid timeout: $2"
+        timeout=$2; shift 2 ;;
+      --classify-fixture) (($# >= 2)) || die "missing value for $1"; fixture_dir=$2; shift 2 ;;
+      --classify-graphql) (($# >= 2)) || die "missing value for $1"; graphql_file=$2; shift 2 ;;
+      --now) (($# >= 2)) || die "missing value for $1"; fixture_now=$2; shift 2 ;;
+      --last-trigger) (($# >= 2)) || die "missing value for $1"; last_trigger=$2; shift 2 ;;
+      -h|--help) usage 0 ;;
+      --) shift; arg=${1:-}; break ;;
+      -*) die "unknown option: $1" ;;
+      *) [[ -z $arg ]] || die "unexpected extra argument: $1"; arg=$1; shift ;;
+    esac
+  done
+
+  if [[ -n $fixture_dir ]]; then
+    local snap now_epoch
+    snap=$(snapshot_from_fixture_dir "$fixture_dir")
+    now_epoch=${fixture_now:-$(date +%s)}
+    classify_snapshot "$snap" "$now_epoch" "$mode" "$review_only" "$require_review" "$last_trigger"
+    return
+  fi
+
+  if [[ -n $graphql_file ]]; then
+    local snap now_epoch
+    snap=$(snapshot_from_graphql_file "$graphql_file")
+    now_epoch=${fixture_now:-$(date +%s)}
+    classify_snapshot "$snap" "$now_epoch" "$mode" "$review_only" "$require_review" "$last_trigger"
+    return
+  fi
+
+  [[ -n $arg ]] || usage 1
+  resolve_target "$arg" "$repo"
+
+  local start_epoch=$SECONDS snap decision action exit_code event detail wait_sec
+
+  sleep_bounded() {
+    local want=$1 rem=$((timeout - (SECONDS - start_epoch)))
+    ((rem > 0)) || die "timed out after ${timeout}s on $REPO#$PR"
+    sleep $((want < rem ? want : rem))
+  }
+
+  while :; do
+    ((SECONDS - start_epoch < timeout)) || die "timed out after ${timeout}s on $REPO#$PR"
+
+    if ! snap=$(fetch_snapshot); then
+      sleep_bounded "$interval"
+      continue
+    fi
+    decision=$(classify_snapshot "$snap" "$(date +%s)" "$mode" "$review_only" "$require_review" "$last_trigger")
+    local fields=()
+    mapfile -t fields < <(
+      jq -r '.action, (.exit | tostring), .event, ((.detail // "") | gsub("[\\r\\n]"; " ")), ((.waitSeconds // 0) | tostring)' <<<"$decision"
+    )
+    action=${fields[0]} exit_code=${fields[1]} event=${fields[2]} detail=${fields[3]} wait_sec=${fields[4]}
+
+    case $action in
+      done)
+        printf 'EVENT: %s (%s#%s) %s\n' "$event" "$REPO" "$PR" "$detail"
+        exit "$exit_code"
+        ;;
+      confirm_blocked)
+        # Auto-merge can lag a few seconds behind the final green check.
+        sleep_bounded 15
+        if ! snap=$(fetch_snapshot); then
+          sleep_bounded "$interval"
+          continue
+        fi
+        decision=$(classify_snapshot "$snap" "$(date +%s)" "$mode" "$review_only" "$require_review" "$last_trigger")
+        mapfile -t fields < <(
+          jq -r '.action, (.exit | tostring), .event, ((.detail // "") | gsub("[\\r\\n]"; " "))' <<<"$decision"
+        )
+        action=${fields[0]} exit_code=${fields[1]} event=${fields[2]} detail=${fields[3]}
+        if [[ $action == "done" || $action == "confirm_blocked" ]]; then
+          printf 'EVENT: %s (%s#%s) %s\n' "$event" "$REPO" "$PR" "$detail"
+          exit "$exit_code"
+        fi
+        ;;
+      trigger_review)
+        if [[ $no_trigger == true ]]; then
+          printf 'EVENT: %s (%s#%s) %s (--no-trigger)\n' "$event" "$REPO" "$PR" "$detail"
+          exit 1
+        fi
+        sleep_bounded $((RANDOM % 15 + 1))
+        printf '[%s] %s#%s: %s -> posting @%s review\n' "$(date -u +%H:%M:%SZ)" "$REPO" "$PR" "$detail" "$BOT"
+        if ! gh pr comment "$PR" -R "$REPO" --body "@$BOT review" >/dev/null; then
+          printf 'pr-wait: failed to post review comment (will retry)\n' >&2
+          sleep_bounded "$interval"
+          continue
+        fi
+        last_trigger=$(($(date +%s) - 10))
+        sleep_bounded 30
+        ;;
+      sleep_then_trigger)
+        if [[ $no_trigger == true ]]; then
+          printf 'EVENT: %s (%s#%s) %s (--no-trigger)\n' "$event" "$REPO" "$PR" "$detail"
+          exit 1
+        fi
+        printf '[%s] %s#%s: %s\n' "$(date -u +%H:%M:%SZ)" "$REPO" "$PR" "$detail"
+        # Sleep one bounded chunk and re-poll: only a fresh trigger_review
+        # classification from the main loop is permitted to post.
+        local chunk=$((wait_sec + (RANDOM % 20)))
+        sleep_bounded $((chunk < interval ? chunk : interval))
+        ;;
+      wait)
+        printf '[%s] %s#%s: %s (%s)\n' "$(date -u +%H:%M:%SZ)" "$REPO" "$PR" "$event" "$detail"
+        sleep_bounded "$interval"
+        ;;
+    esac
+  done
+}
+
+main "$@"

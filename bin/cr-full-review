@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# cr-full-review: a CodeRabbit review of whole files instead of a diff.
+#
+# Opens a throwaway PR whose base is an empty tree, so every line of the chosen
+# paths shows as new, then collects the findings and deletes the PR's branches.
+#
+#   cr-full-review open [-R owner/repo] [-r rev] [-n name] [--dry-run] [path...]
+#   cr-full-review steward [-R owner/repo] [path...]   queue via cr-steward (full repo or paths)
+#   cr-full-review wait <pr-url>        until CodeRabbit has reviewed (`open` asks for the review)
+#   cr-full-review findings <pr-url>    save review bodies and threads to ~/.cache/cr-full-review/
+#   cr-full-review close <pr-url>       save findings, close the PR, delete both branches
+#
+# Run `open` inside the repo (git or jj); without paths it reviews the whole tree at rev.
+# The PR goes to the remote whose URL names owner/repo (default: origin's), so a fork
+# works for upstreams without CodeRabbit.
+set -euo pipefail
+
+LABEL=cr-review
+BOT=coderabbitai
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/cr-full-review
+
+die() { echo "cr-full-review: $*" >&2; exit 1; }
+usage() { sed -n '2,13s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
+
+# owner/repo and number from a PR URL.
+parse_pr() {
+  [[ $1 =~ github\.com/([^/]+/[^/]+)/pull/([0-9]+) ]] || die "not a PR URL: $1"
+  REPO=${BASH_REMATCH[1]} PR=${BASH_REMATCH[2]}
+}
+
+repo_of_url() { sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##' <<<"$1"; }
+
+cmd_open() {
+  local repo="" rev="" name="" dry=0 paths=()
+  while (($#)); do
+    case $1 in
+      -R) repo=$2; shift 2 ;;
+      -r) rev=$2; shift 2 ;;
+      -n) name=$2; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      -h|--help) usage ;;
+      --) shift; paths+=("$@"); break ;;
+      -*) die "unknown option $1" ;;
+      *) paths+=("$1"); shift ;;
+    esac
+  done
+
+  # In jj, default to @ (git's HEAD is @-); a workspace may have no .git of its own.
+  if command -v jj >/dev/null && jj root >/dev/null 2>&1; then
+    : "${rev:=$(jj log --no-graph -r @ -T commit_id)}"
+    git rev-parse --git-dir >/dev/null 2>&1 || { GIT_DIR=$(jj git root); export GIT_DIR; }
+  fi
+  git rev-parse --git-dir >/dev/null 2>&1 || die "not in a git or jj repo"
+  : "${rev:=HEAD}"
+  rev=$(git rev-parse --verify "$rev^{commit}")
+
+  local remote
+  if [[ -z $repo ]]; then
+    remote=origin
+    repo=$(repo_of_url "$(git remote get-url --push origin)")
+  else
+    remote=""
+    for r in $(git remote); do
+      [[ $(repo_of_url "$(git remote get-url --push "$r")") == "$repo" ]] || continue
+      [[ -z $remote ]] || die "remotes $remote and $r both push to $repo: pick one with git remote"
+      remote=$r
+    done
+    [[ -n $remote ]] || die "no remote pushes to $repo"
+  fi
+
+  local tree
+  if ((${#paths[@]})); then
+    local idx; idx=$(mktemp); rm -f "$idx"
+    GIT_INDEX_FILE=$idx git read-tree --empty
+    git ls-tree -r --full-tree "$rev" -- "${paths[@]}" | GIT_INDEX_FILE=$idx git update-index --index-info
+    tree=$(GIT_INDEX_FILE=$idx git write-tree)
+    rm -f "$idx"
+  else
+    tree=$(git rev-parse "$rev^{tree}")
+  fi
+  local empty; empty=$(git mktree </dev/null)
+  [[ $tree != "$empty" ]] || die "no files match ${paths[*]} at $rev"
+  local files; files=$(git ls-tree -r --name-only "$tree" | wc -l)
+
+  : "${name:=$(basename "${paths[0]:-${repo#*/}}")}"
+  name=$(tr -c 'A-Za-z0-9._-' '-' <<<"$name" | sed -E 's/\.\.+/./g; s/^[.-]+//; s/[.-]+$//')
+  [[ -n $name ]] || name=review
+  local branch
+  branch="review/$name-$(date +%Y%m%d-%H%M%S)"
+  git check-ref-format "refs/heads/$branch/base" || die "invalid branch name $branch"
+
+  # Throwaway commits: unsigned on purpose, no review branch is ever merged.
+  local base head
+  base=$(git commit-tree --no-gpg-sign "$empty" -m "review base: empty tree")
+  head=$(git commit-tree --no-gpg-sign -p "$base" "$tree" -m "review: $name at ${rev:0:12}")
+
+  echo "repo:   $repo (remote $remote)"
+  echo "source: ${rev:0:12}, $files file(s)${paths[*]:+: ${paths[*]}}"
+  echo "branch: $branch/{base,all}"
+  ((dry)) && { echo "dry run: nothing pushed"; return; }
+
+  # gh's token instead of an OAuth or askpass prompt (they hang or pop up a browser).
+  GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false \
+    git -c credential.helper= -c credential.helper='!gh auth git-credential' \
+    push --no-verify "$remote" "$base:refs/heads/$branch/base" "$head:refs/heads/$branch/all" >/dev/null
+  gh label create "$LABEL" -R "$repo" --color 5319e7 --description "Request a CodeRabbit review" >/dev/null 2>&1 || true
+  local url
+  url=$(gh pr create -R "$repo" --base "$branch/base" --head "$branch/all" --label "$LABEL" \
+    --title "[review only] $name full review, do not merge" \
+    --body "Full-code CodeRabbit review of ${paths[*]:-the whole tree} at \`$rev\` ($files files). The base branch is an empty tree, so every line shows as new.
+
+**Do not merge.** Findings get fixed in normal PRs; this PR and both branches are deleted afterwards (\`cr-full-review close\`).")
+  # CodeRabbit never auto-reviews a PR whose base isn't the default branch: ask.
+  gh pr comment "$url" --body "@$BOT review" >/dev/null
+  echo "$url"
+}
+
+cmd_wait() {
+  parse_pr "${1:?PR URL}"
+  "$(dirname "$0")/pr-wait" --review-only --require-review "$1"
+  echo "reviewed: $(gh pr view "$PR" -R "$REPO" --json url --jq .url)"
+}
+
+cmd_findings() {
+  parse_pr "${1:?PR URL}"
+  mkdir -p "$CACHE"
+  local out="$CACHE/${REPO/\//-}-$PR.md" owner=${REPO%/*} name=${REPO#*/} tmp
+  tmp=$(mktemp "$out.XXXXXX")
+  # RETURN traps are global: remove it once it has run.
+  trap 'rm -f "${tmp:-}"; trap - RETURN' RETURN
+  {
+    echo "# CodeRabbit findings: $REPO#$PR"
+    echo
+    gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
+      --jq ".[] | select(.user.login | startswith(\"$BOT\")) | \"## Review (\(.state))\n\n\(.body)\n\""
+    local after="" page
+    while :; do
+      # shellcheck disable=SC2016 # GraphQL variables, not shell ones
+      page=$(gh api graphql -F owner="$owner" -F name="$name" -F pr="$PR" ${after:+-F after="$after"} -f query='
+        query($owner:String!,$name:String!,$pr:Int!,$after:String){repository(owner:$owner,name:$name){
+          pullRequest(number:$pr){reviewThreads(first:100,after:$after){pageInfo{hasNextPage endCursor}
+            nodes{path line isResolved comments(first:100){nodes{author{login} body}}}}}}}')
+      # Every comment of a thread: a reply may correct or withdraw the finding.
+      jq -r '.data.repository.pullRequest.reviewThreads.nodes[] |
+        "## \(.path):\(.line // "file")\(if .isResolved then " (resolved)" else "" end)\n\n" +
+        ([.comments.nodes[] | "**\(.author.login // "ghost"):**\n\n\(.body)\n"] | join("\n"))' <<<"$page"
+      [[ $(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' <<<"$page") == true ]] || break
+      after=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor' <<<"$page")
+    done
+  } >"$tmp"
+  mv "$tmp" "$out"
+  echo "$out ($(grep -c '^## ' "$out") sections)"
+}
+
+cmd_close() {
+  parse_pr "${1:?PR URL}"
+  cmd_findings "$1"
+  local base head fork state
+  read -r base head fork state < <(gh pr view "$PR" -R "$REPO" --json baseRefName,headRefName,isCrossRepository,state \
+    --jq '"\(.baseRefName) \(.headRefName) \(.isCrossRepository) \(.state)"')
+  [[ $base == review/*/base && $head == review/*/all && $fork == false ]] ||
+    die "not a cr-full-review PR ($base <- $head, cross-repo: $fork)"
+  [[ $state != OPEN ]] || gh pr close "$PR" -R "$REPO" --comment "Findings collected; closing the review-only PR." >/dev/null
+  # Retries resume: a branch that is already gone counts as deleted.
+  local b err rc=0
+  for b in "$head" "$base"; do
+    err=$(gh api -X DELETE "repos/$REPO/git/refs/heads/$b" 2>&1 >/dev/null) && continue
+    grep -q 'Reference does not exist' <<<"$err" || { echo "deleting $b: $err" >&2; rc=1; }
+  done
+  ((rc == 0)) || die "some branches remain; rerun close"
+  echo "closed $REPO#$PR, deleted $base and $head"
+}
+
+cmd_steward() {
+  command -v cr-steward >/dev/null 2>&1 || die "cr-steward not found on PATH (use 'open' for standalone mode)"
+  local repo="" paths=()
+  while (($#)); do
+    case $1 in
+      -R) repo=$2; shift 2 ;;
+      -h|--help) usage ;;
+      --) shift; paths+=("$@"); break ;;
+      -*) die "unknown option $1" ;;
+      *) paths+=("$1"); shift ;;
+    esac
+  done
+  if [[ -z $repo ]]; then
+    if command -v jj >/dev/null && jj root >/dev/null 2>&1; then
+      git rev-parse --git-dir >/dev/null 2>&1 || { GIT_DIR=$(jj git root); export GIT_DIR; }
+    fi
+    repo=$(repo_of_url "$(git remote get-url --push origin)")
+  fi
+  if ((${#paths[@]})); then
+    local joined
+    joined=$(IFS=,; printf '%s' "${paths[*]}")
+    exec cr-steward request "$repo" --paths "$joined"
+  else
+    exec cr-steward request "$repo" --full
+  fi
+}
+
+case ${1:-} in
+  open|steward|wait|findings|close) c=$1; shift; "cmd_$c" "$@" ;;
+  -h|--help|"") usage ;;
+  *) die "unknown command $1 (open, steward, wait, findings, close)" ;;
+esac
