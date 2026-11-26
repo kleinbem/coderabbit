@@ -145,7 +145,18 @@ assert_eq "unlabelled-default-ok" "$(jq -r '.action + ":" + (.exit|tostring)' <<
 res=$("$PR_WAIT" --classify-fixture "$TMP/unlabelled-skip" --require-review --now "$now_2004")
 assert_eq "unlabelled-require-review-fails" "$(jq -r '.action + ":" + (.exit|tostring)' <<<"$res")" "done:1"
 
-# 10. Optional: verify against captured live fixtures when cache base is configured
+# 10. Large (> 200 KiB) comment payload does not trip Linux MAX_ARG_STRLEN in normalize_graphql_snapshot
+printf '%s' "$(printf '%220000s' '' | tr ' ' 'x')" | jq -Rs '[{databaseId:1,author:{login:"coderabbitai"},createdAt:"2026-11-22T17:01:00Z",updatedAt:"2026-11-22T17:01:00Z",body:.}]' >"$TMP/big_cmts.json"
+raw_gql=$(jq -n '{data:{repository:{pullRequest:{state:"OPEN",isDraft:false,mergeStateStatus:"CLEAN",mergeCommit:null,autoMergeRequest:null,author:{__typename:"User",login:"kleinbem"},headRefOid:"deadbeef",commits:{nodes:[{commit:{committedDate:"2026-11-22T17:00:00Z",signature:{isValid:true}}}]},labels:{nodes:[{name:"cr-review"}]}}}}}')
+big_snap=$(bash -c '
+  source <(sed "/^main \"\$@\"$/d" "$1")
+  LABEL=cr-review
+  big_cmts=$(<"$3")
+  normalize_graphql_snapshot "$2" 0 "[]" "$big_cmts" true
+' _ "$PR_WAIT" "$raw_gql" "$TMP/big_cmts.json")
+assert_eq "large-comment-snapshot" "$(jq -r '.comments[0].body | length' <<<"$big_snap")" "220000"
+
+# 11. Optional: verify against captured live fixtures when cache base is configured
 CACHE_BASE=${XDG_CACHE_HOME:-${HOME:+$HOME/.cache}}
 if [[ -n $CACHE_BASE && -d $CACHE_BASE/coderabbit-steward-experiments/cases ]]; then
   CASES=$CACHE_BASE/coderabbit-steward-experiments/cases
