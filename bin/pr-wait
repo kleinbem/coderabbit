@@ -52,9 +52,12 @@ resolve_target() {
 # paginated connections) into the canonical classifier snapshot.
 normalize_graphql_snapshot() {
   local raw=$1 unresolved=$2 all_ctxs=$3 all_cmts=$4 cmts_complete=$5
-  jq --argjson unresolved "$unresolved" \
-     --argjson ctxs "$all_ctxs" \
-     --argjson cmts "$all_cmts" \
+  # Stream the potentially large GraphQL payload and paginated arrays via stdin
+  # instead of --argjson to avoid Linux MAX_ARG_STRLEN (128 KiB) argv limits on
+  # large multi-file reviews.
+  printf '%s\n%s\n%s\n' "$raw" "$all_ctxs" "$all_cmts" | \
+  jq -s \
+     --argjson unresolved "$unresolved" \
      --argjson cmts_complete "$cmts_complete" \
      --arg label "$LABEL" '
     def ts:
@@ -65,7 +68,9 @@ normalize_graphql_snapshot() {
     def is_cr_check:
       .__typename == "CheckRun" and (((.checkSuite.app.slug // "") == "coderabbitai") or .name == "CodeRabbit");
 
-    .data.repository.pullRequest as $pr |
+    .[0].data.repository.pullRequest as $pr |
+    .[1] as $ctxs |
+    .[2] as $cmts |
     ($pr.commits.nodes[0].commit // {}) as $c |
     ($cmts | unique_by(.databaseId)) as $uniq_cmts |
 
@@ -125,7 +130,7 @@ normalize_graphql_snapshot() {
         ] | sort_by(.createdEpoch)
       )
     }
-  ' <<<"$raw"
+  '
 }
 
 # Fetch a normalized JSON snapshot of the PR via GraphQL, following pagination
